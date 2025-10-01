@@ -1,0 +1,45 @@
+BasedOnStyle: Google
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+DerivePointerAlignment: false
+PointerAlignment: Left
+SortIncludes: true
+IncludeBlocks: Regroup
+Language: Cpp
+
+PenaltyBreakBeforeFirstCallParameter: 1
+AllowShortFunctionsOnASingleLine: Empty
+
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  SplitEmptyFunction: false
+  SplitEmptyNamespace: false
+  SplitEmptyRecord: false
+
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveDeclarations: Consecutive
+
+IndentCaseLabels: true
+
+NamespaceIndentation: None
+
+SpacesInParentheses: false
+SpaceBeforeParens: ControlStatements
+
+Standard: Cpp17
+
+---
+Language: CUDA
+DerivePointerAlignment: false
+PointerAlignment: Left
+

@@ -1,0 +1,72 @@
+# Compiled object files and libraries
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# CUDA build artifacts
+*.ptx
+*.cubin
+*.fatbin
+*.linkinfo
+*.nvvm
+
+# Binaries
+alltoallv_ucx_device
+bin/
+out/
+dist/
+build/
+cmake-build-*/
+
+# Debug and profiler outputs
+*.dSYM/
+*.nvprof
+*.nsys-rep
+*.nvvp
+*.prof
+*.trace
+
+# Logs
+*.log
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python caches (if any tooling uses Python)
+__pycache__/
+.pytest_cache/
+
+# clangd/clang caches
+.cache/
+.clangd/
+
+# Package archives and large downloads
+*.tar
+*.tar.gz
+*.tgz
+*.tbz
+*.tbz2
+*.zip
+*.deb
+
+# Docker
+.dockerignore
+.env
+
+# Generated files you may choose to keep tracked; comment out to keep
+# compile_commands.json
+
+
