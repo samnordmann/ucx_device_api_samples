@@ -78,6 +78,14 @@ __global__ void do_alltoallv_kernel(kernel_params_t params,
                                                    op.length,
                                                    UCT_DEVICE_FLAG_NODELAY,
                                                    req);
+    if (st == UCS_OK) {
+        for (;;) {
+            st = ucp_device_progress_req<level>(req);
+            if (st != UCS_INPROGRESS) {
+                break;
+            }
+        }
+    }
     if (st != UCS_OK) {
         (void)atomicCAS((int*)status_out, (int)UCS_OK, (int)st);
     }
@@ -135,7 +143,6 @@ static void create_all_endpoints(ucp_worker_h worker, int rank, int size, std::v
 
 static void run_device_kernel_benchmark(int rank,
                                         int world_size,
-                                        ucp_worker_h worker,
                                         const kernel_params_t &kparams,
                                         const put_op_t *d_ops,
                                         unsigned num_ops,
@@ -178,7 +185,6 @@ static void run_device_kernel_benchmark(int rank,
         float _ = timed_kernel_iteration();
         (void)_;
         check_kernel_success();
-        UCP_CHECK(ucp_worker_flush(worker), "ucp_worker_flush");
     }
 
     // Measure
@@ -191,7 +197,6 @@ static void run_device_kernel_benchmark(int rank,
         if (iter_ms < min_ms) min_ms = iter_ms;
         if (iter_ms > max_ms) max_ms = iter_ms;
         check_kernel_success();
-        UCP_CHECK(ucp_worker_flush(worker), "ucp_worker_flush");
     }
 
     // Compute per-rank average latency (ms)
@@ -436,8 +441,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "Rank %d kernel failed: %d\n", rank, h_status);
         MPI_Abort(MPI_COMM_WORLD, h_status);
     }
-    // TODO: Is call to flush necessary?
-    UCP_CHECK(ucp_worker_flush(worker), "ucp_worker_flush");
 
     // Handle self-copy on host to emulate alltoallv semantics for self
     void *dst = (void*)((uintptr_t)recv_buf + recvdispls[rank]);
@@ -461,7 +464,7 @@ int main(int argc, char **argv)
     }
 
     // Benchmark
-    run_device_kernel_benchmark(rank, world_size, worker, kparams, d_ops, num_ops, d_status, h_status, sendcounts);
+    run_device_kernel_benchmark(rank, world_size, kparams, d_ops, num_ops, d_status, h_status, sendcounts);
 
     // Cleanup
     CUDA_CHECK(cudaFree(d_ops));
