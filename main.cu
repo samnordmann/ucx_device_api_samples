@@ -10,7 +10,28 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#include <stdexcept>
+
+/*
+Global parameter to control whether the transfers are transported by nvLinks or by Infiniband on the scale-out network.
+UCX device-side API is transparent to the transport being used, in the sense that the API semantics supports those two transports.
+However, to get the best performance, the developper has to adapt the kernels to the underlying transport.
+Indeed, the two transports obey to much different paradigms.
+
+On the one hand, nvLinks transports triggered by device-side API are 
+1) SM-driven, which means we need many threads to participate to the transfer to get good performance
+2) blocking, meaning that we do not need to check for completion.
+
+On the other hand, Infiniband is
+1) driven by the NIC, whichmeans we need a single thread to participate to the transfer (the thread will only ring a doorbell to the NIC) ; therefore we want each thread to post a different request dso we can emit enough request to saturate the network's BW
+2) non-blocking, meaning that we need to check for completion.
+
+The API `ucp_device_put_single` take a template parameter `level` that controls the level of concurrency, which can be either of "thread" or "warp" or "block".
+For example, a level "block" means that all threads in the block must participate to the same call ; "thread" level means only one thread must participate to the same call.
+Typically, an nvLink transport requires a "block" level to get good performance, whereas an Infiniband transport requires a "thread".
+
+The API `ucp_device_progress_req` is used to check for completion of a request. It is typically a trivial call in the case of an nvLink transport.
+*/
+constexpr bool nvLink_transport = true;
 
 // Simple CUDA check
 #define CUDA_CHECK(cmd) do { \
@@ -52,14 +73,35 @@ typedef struct {
 typedef struct {
     unsigned     list_handle_index; // index into params.mem_lists (per-destination)
     unsigned     element_index;     // element inside that mem list (always 0 here)
-    const void  *address;           // local source address on device
-    uint64_t     remote_address;    // remote device address at peer
+    size_t       local_offset;      // offset from base local_addr in mem list
+    size_t       remote_offset;     // offset from base remote_addr in mem list
     size_t       length;            // bytes to transfer
 } put_op_t;
 
+__global__ void do_alltoallv_kernel_nvLink_transport(kernel_params_t params,
+                                     const put_op_t *ops,
+                                     unsigned num_ops,
+                                     ucs_status_t *status_out)
+{
+    unsigned bid = blockIdx.x;
+    if (bid >= num_ops) return;
+
+    // All threads in the block participate in the same PUT to maximize SM-driven bandwidth
+    const put_op_t &op = ops[bid];
+    ucs_status_t st = ucp_device_put_single<UCS_DEVICE_LEVEL_BLOCK>(params.mem_lists[op.list_handle_index],
+                                                   op.element_index,
+                                                   op.local_offset,
+                                                   op.remote_offset,
+                                                   op.length,
+                                                   /*channel_id=*/0,
+                                                   UCP_DEVICE_FLAG_NODELAY,
+                                                   /*req=*/nullptr);
+    // Update status out
+    (void)atomicCAS((int*)status_out, (int)UCS_OK, (int)st);
+}
+
 // Runs the device kernel benchmark and prints performance on rank 0
-template <ucs_device_level_t level>
-__global__ void do_alltoallv_kernel(kernel_params_t params,
+__global__ void do_alltoallv_kernel_ib_transport(kernel_params_t params,
                                      const put_op_t *ops,
                                      unsigned num_ops,
                                      ucs_status_t *status_out)
@@ -71,24 +113,24 @@ __global__ void do_alltoallv_kernel(kernel_params_t params,
     ucp_device_request_t *req = &req_obj;
 
     const put_op_t &op = ops[tid];
-    ucs_status_t st = ucp_device_put_single<level>(params.mem_lists[op.list_handle_index],
+    ucs_status_t st = ucp_device_put_single<UCS_DEVICE_LEVEL_THREAD>(params.mem_lists[op.list_handle_index],
                                                    op.element_index,
-                                                   op.address,
-                                                   op.remote_address,
+                                                   op.local_offset,
+                                                   op.remote_offset,
                                                    op.length,
-                                                   UCT_DEVICE_FLAG_NODELAY,
+                                                   /*channel_id=*/0,
+                                                   UCP_DEVICE_FLAG_NODELAY,
                                                    req);
     if (st == UCS_OK) {
         for (;;) {
-            st = ucp_device_progress_req<level>(req);
+            st = ucp_device_progress_req<UCS_DEVICE_LEVEL_THREAD>(req);
             if (st != UCS_INPROGRESS) {
                 break;
             }
         }
     }
-    if (st != UCS_OK) {
-        (void)atomicCAS((int*)status_out, (int)UCS_OK, (int)st);
-    }
+    // Update status out
+    (void)atomicCAS((int*)status_out, (int)UCS_OK, (int)st);
 }
 
 static void init_ucp(ucp_context_h &ucp_ctx, ucp_worker_h &worker)
@@ -168,7 +210,11 @@ static void run_device_kernel_benchmark(int rank,
         CUDA_CHECK(cudaEventCreate(&ev_start));
         CUDA_CHECK(cudaEventCreate(&ev_stop));
         CUDA_CHECK(cudaEventRecord(ev_start));
-        do_alltoallv_kernel<UCS_DEVICE_LEVEL_THREAD><<<kparams.num_blocks, kparams.num_threads>>>(kparams, d_ops, num_ops, d_status);
+        if (nvLink_transport) {
+            do_alltoallv_kernel_nvLink_transport<<<kparams.num_blocks, kparams.num_threads>>>(kparams, d_ops, num_ops, d_status);
+        } else {
+            do_alltoallv_kernel_ib_transport<<<kparams.num_blocks, kparams.num_threads>>>(kparams, d_ops, num_ops, d_status);
+        }
         CUDA_CHECK(cudaEventRecord(ev_stop));
         CUDA_CHECK(cudaEventSynchronize(ev_stop));
         float iter_ms = 0.0f;
@@ -266,6 +312,8 @@ int main(int argc, char **argv)
     }
     int dev = local_rank;
     CUDA_CHECK(cudaSetDevice(dev));
+    // Ensure primary context is created and current for UCX driver API hooks
+    CUDA_CHECK(cudaFree(0));
 
     // Init UCP
     ucp_context_h ucp_ctx = nullptr; ucp_worker_h worker = nullptr;
@@ -369,9 +417,16 @@ int main(int argc, char **argv)
     for (int p = 0; p < world_size; ++p) {
         if (p == rank) continue;
         ucp_device_mem_list_elem_t elem;
-        elem.field_mask = UCP_DEVICE_MEM_LIST_ELEM_FIELD_MEMH | UCP_DEVICE_MEM_LIST_ELEM_FIELD_RKEY;
-        elem.memh       = send_memh;
-        elem.rkey       = peer_rkeys[p];
+        elem.field_mask = UCP_DEVICE_MEM_LIST_ELEM_FIELD_MEMH |
+                          UCP_DEVICE_MEM_LIST_ELEM_FIELD_RKEY |
+                          UCP_DEVICE_MEM_LIST_ELEM_FIELD_LOCAL_ADDR |
+                          UCP_DEVICE_MEM_LIST_ELEM_FIELD_REMOTE_ADDR |
+                          UCP_DEVICE_MEM_LIST_ELEM_FIELD_LENGTH;
+        elem.memh        = send_memh;
+        elem.rkey        = peer_rkeys[p];
+        elem.local_addr  = send_buf;
+        elem.length      = total_send;
+        elem.remote_addr = peer_bases[p];
 
         ucp_device_mem_list_params_t ml_params;
         memset(&ml_params, 0, sizeof(ml_params));
@@ -400,9 +455,9 @@ int main(int argc, char **argv)
         put_op_t op;
         op.list_handle_index = p;
         op.element_index     = element_index[p];
-        op.address        = (const void*)((uintptr_t)send_buf + senddispls[p]);
+        op.local_offset   = (size_t)senddispls[p];
         size_t remote_off = all_recvdispls[p * world_size + rank];
-        op.remote_address = peer_bases[p] + remote_off;
+        op.remote_offset  = remote_off;
         op.length         = sendcounts[p];
         ops.push_back(op);
     }
@@ -414,12 +469,22 @@ int main(int argc, char **argv)
 
     // Prepare kernel params
     kernel_params_t kparams = {};
-    const unsigned threads_per_block = 128;
     const unsigned num_ops = static_cast<unsigned>(ops.size());
-    const unsigned num_blocks = (num_ops + threads_per_block - 1) / threads_per_block;
+    unsigned threads_per_block = 0;
+    unsigned num_blocks = 0;
+    if (nvLink_transport) {
+        // One block per peer, all threads in block cooperate on the same PUT
+        threads_per_block = 128; // many threads to drive nvLink
+        num_blocks        = (num_ops > 0) ? num_ops : 1;
+        kparams.level     = UCS_DEVICE_LEVEL_BLOCK;
+    } else {
+        // Single block, one thread per peer
+        num_blocks        = 1;
+        threads_per_block = (num_ops > 0) ? num_ops : 1;
+        kparams.level     = UCS_DEVICE_LEVEL_THREAD;
+    }
     kparams.num_threads  = threads_per_block;
     kparams.num_blocks   = num_blocks;
-    kparams.level        = UCS_DEVICE_LEVEL_THREAD;
     kparams.with_request = false;
     // Upload mem list handle array to device
     ucp_device_mem_list_handle_h *d_mem_lists = nullptr;
@@ -433,7 +498,11 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMalloc(&d_status, sizeof(*d_status)));
     CUDA_CHECK(cudaMemcpy(d_status, &h_status, sizeof(h_status), cudaMemcpyHostToDevice));
 
-    do_alltoallv_kernel<UCS_DEVICE_LEVEL_THREAD><<<kparams.num_blocks, kparams.num_threads>>>(kparams, d_ops, num_ops, d_status);
+    if (nvLink_transport) {
+        do_alltoallv_kernel_nvLink_transport<<<kparams.num_blocks, kparams.num_threads>>>(kparams, d_ops, num_ops, d_status);
+    } else {
+        do_alltoallv_kernel_ib_transport<<<kparams.num_blocks, kparams.num_threads>>>(kparams, d_ops, num_ops, d_status);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(&h_status, d_status, sizeof(h_status), cudaMemcpyDeviceToHost));
